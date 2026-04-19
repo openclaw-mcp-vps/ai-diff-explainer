@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  border-color: rgb(39 39 42 / 1);
+}
+
+body {
+  background: radial-gradient(circle at 20% 0%, #122031 0%, #0d1117 45%);
+  color: #e4e4e7;
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
