@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" fill="none">
+  <rect width="1200" height="630" fill="#0D1117"/>
+  <circle cx="1040" cy="120" r="220" fill="#1F6FEB" fill-opacity="0.18"/>
+  <circle cx="140" cy="540" r="280" fill="#3FB950" fill-opacity="0.2"/>
+  <rect x="94" y="86" width="1012" height="458" rx="24" fill="#161B22" stroke="#30363D" stroke-width="2"/>
+  <text x="150" y="220" fill="#E6EDF3" font-family="Arial, sans-serif" font-size="64" font-weight="700">AI Diff Explainer</text>
+  <text x="150" y="288" fill="#8B949E" font-family="Arial, sans-serif" font-size="34">Paste a PR URL, get a 3-bullet stakeholder changelog.</text>
+  <rect x="150" y="346" width="900" height="70" rx="14" fill="#0D1117" stroke="#30363D"/>
+  <text x="182" y="390" fill="#3FB950" font-family="Arial, sans-serif" font-size="26">• Product impact • Timeline risk • Release-ready messaging</text>
+</svg>

@@ -1,163 +1,295 @@
 import { Octokit } from "@octokit/rest";
 
-export type ParsedPrUrl = {
+const MAX_FILES_IN_PROMPT = 25;
+const MAX_ISSUES = 10;
+const ISSUE_REFERENCE_REGEX =
+  /(?:([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+))?#(\d+)/g;
+
+export class GitHubIntegrationError extends Error {
+  status: number;
+
+  constructor(message: string, status = 400) {
+    super(message);
+    this.name = "GitHubIntegrationError";
+    this.status = status;
+  }
+}
+
+export type PullRequestFile = {
+  filename: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+  patch: string | null;
+};
+
+export type PullRequestCommit = {
+  sha: string;
+  message: string;
+  authoredAt: string | null;
+};
+
+export type LinkedIssue = {
   owner: string;
   repo: string;
-  pullNumber: number;
+  number: number;
+  title: string;
+  state: string;
+  url: string;
 };
 
 export type PullRequestContext = {
   owner: string;
   repo: string;
-  pullNumber: number;
-  prTitle: string;
-  prBody: string;
-  prAuthor: string;
-  prUrl: string;
+  number: number;
+  title: string;
+  body: string;
+  url: string;
+  author: string;
+  baseBranch: string;
+  headBranch: string;
   additions: number;
   deletions: number;
   changedFiles: number;
-  fileDiffs: Array<{
-    filename: string;
-    status: string;
-    additions: number;
-    deletions: number;
-    patch: string;
-  }>;
-  commitMessages: string[];
-  linkedIssues: Array<{
-    number: number;
-    title: string;
-    state: "open" | "closed";
-    url: string;
-  }>;
+  createdAt: string;
+  mergedAt: string | null;
+  labels: string[];
+  commits: PullRequestCommit[];
+  files: PullRequestFile[];
+  linkedIssues: LinkedIssue[];
 };
 
-const ISSUE_REF_REGEX = /#(\d+)/g;
+type ParsedPullRequestUrl = {
+  owner: string;
+  repo: string;
+  number: number;
+};
 
-export function parsePullRequestUrl(url: string): ParsedPrUrl {
-  let parsed: URL;
+type IssueReference = {
+  owner: string;
+  repo: string;
+  number: number;
+};
+
+function createOctokit() {
+  const token = process.env.GITHUB_TOKEN;
+
+  return new Octokit({
+    auth: token,
+    userAgent: "ai-diff-explainer/1.0",
+  });
+}
+
+export function parsePullRequestUrl(prUrl: string): ParsedPullRequestUrl {
+  let parsedUrl: URL;
 
   try {
-    parsed = new URL(url);
+    parsedUrl = new URL(prUrl);
   } catch {
-    throw new Error("Please enter a valid GitHub pull request URL.");
+    throw new GitHubIntegrationError("Invalid URL format.", 400);
   }
 
-  if (parsed.hostname !== "github.com") {
-    throw new Error("Only github.com pull request URLs are supported.");
+  if (parsedUrl.hostname !== "github.com") {
+    throw new GitHubIntegrationError("Only github.com pull request URLs are supported.", 400);
   }
 
-  const match = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:\/.*)?$/);
-  if (!match) {
-    throw new Error("URL must look like: https://github.com/owner/repo/pull/123");
+  const segments = parsedUrl.pathname.split("/").filter(Boolean);
+  if (segments.length < 4 || segments[2] !== "pull") {
+    throw new GitHubIntegrationError(
+      "Use a pull request URL like https://github.com/owner/repo/pull/123.",
+      400
+    );
   }
 
-  return {
-    owner: match[1],
-    repo: match[2],
-    pullNumber: Number(match[3]),
-  };
+  const number = Number.parseInt(segments[3] ?? "", 10);
+  if (Number.isNaN(number)) {
+    throw new GitHubIntegrationError("Pull request number is missing in the URL.", 400);
+  }
+
+  const owner = segments[0] ?? "";
+  const repo = segments[1] ?? "";
+
+  if (!owner || !repo) {
+    throw new GitHubIntegrationError("Repository owner and name are required in the URL.", 400);
+  }
+
+  return { owner, repo, number };
 }
 
-function getOctokit() {
-  const token = process.env.GITHUB_TOKEN;
-  return new Octokit({ auth: token, userAgent: "ai-diff-explainer/1.0.0" });
+function truncatePatch(patch: string | null | undefined) {
+  if (!patch) {
+    return null;
+  }
+
+  const maxLength = 1800;
+  if (patch.length <= maxLength) {
+    return patch;
+  }
+
+  return `${patch.slice(0, maxLength)}\n... (patch truncated)`;
 }
 
-function trimPatch(patch: string | undefined, maxChars = 1800) {
-  if (!patch) return "";
-  if (patch.length <= maxChars) return patch;
-  return `${patch.slice(0, maxChars)}\n... [diff truncated]`;
-}
+function extractIssueReferences({
+  text,
+  defaultOwner,
+  defaultRepo,
+}: {
+  text: string;
+  defaultOwner: string;
+  defaultRepo: string;
+}) {
+  const references = new Map<string, IssueReference>();
 
-function extractIssueNumbers(texts: string[]) {
-  const numbers = new Set<number>();
+  for (const match of text.matchAll(ISSUE_REFERENCE_REGEX)) {
+    const owner = match[1] ?? defaultOwner;
+    const repo = match[2] ?? defaultRepo;
+    const number = Number.parseInt(match[3] ?? "", 10);
 
-  for (const text of texts) {
-    for (const match of text.matchAll(ISSUE_REF_REGEX)) {
-      const value = Number(match[1]);
-      if (Number.isInteger(value) && value > 0) {
-        numbers.add(value);
-      }
+    if (!owner || !repo || Number.isNaN(number)) {
+      continue;
     }
+
+    const key = `${owner}/${repo}#${number}`;
+    references.set(key, {
+      owner,
+      repo,
+      number,
+    });
   }
 
-  return [...numbers].slice(0, 15);
+  return Array.from(references.values()).slice(0, MAX_ISSUES);
+}
+
+async function fetchLinkedIssues({
+  octokit,
+  references,
+}: {
+  octokit: Octokit;
+  references: IssueReference[];
+}) {
+  const linkedIssues = await Promise.all(
+    references.map(async (reference) => {
+      try {
+        const issueResponse = await octokit.issues.get({
+          owner: reference.owner,
+          repo: reference.repo,
+          issue_number: reference.number,
+        });
+
+        return {
+          owner: reference.owner,
+          repo: reference.repo,
+          number: reference.number,
+          title: issueResponse.data.title,
+          state: issueResponse.data.state,
+          url: issueResponse.data.html_url,
+        } satisfies LinkedIssue;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  return linkedIssues.filter((issue): issue is LinkedIssue => issue !== null);
 }
 
 export async function fetchPullRequestContext(prUrl: string): Promise<PullRequestContext> {
-  const { owner, repo, pullNumber } = parsePullRequestUrl(prUrl);
-  const octokit = getOctokit();
+  const parsed = parsePullRequestUrl(prUrl);
+  const octokit = createOctokit();
 
-  const [pr, files, commits] = await Promise.all([
-    octokit.pulls.get({ owner, repo, pull_number: pullNumber }),
+  let pullRequestData;
+  try {
+    const response = await octokit.pulls.get({
+      owner: parsed.owner,
+      repo: parsed.repo,
+      pull_number: parsed.number,
+    });
+
+    pullRequestData = response.data;
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "status" in error &&
+      error.status === 404
+    ) {
+      throw new GitHubIntegrationError(
+        "Pull request not found or not accessible with current GitHub credentials.",
+        404
+      );
+    }
+
+    throw new GitHubIntegrationError("Failed to fetch pull request metadata from GitHub.", 502);
+  }
+
+  const [fileList, commitList] = await Promise.all([
     octokit.paginate(octokit.pulls.listFiles, {
-      owner,
-      repo,
-      pull_number: pullNumber,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      pull_number: parsed.number,
       per_page: 100,
     }),
     octokit.paginate(octokit.pulls.listCommits, {
-      owner,
-      repo,
-      pull_number: pullNumber,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      pull_number: parsed.number,
       per_page: 100,
     }),
   ]);
 
-  const commitMessages = commits
-    .map((commit) => commit.commit.message.split("\n")[0]?.trim() ?? "")
-    .filter(Boolean)
-    .slice(0, 30);
+  const files: PullRequestFile[] = fileList.slice(0, MAX_FILES_IN_PROMPT).map((file) => ({
+    filename: file.filename,
+    status: file.status,
+    additions: file.additions,
+    deletions: file.deletions,
+    changes: file.changes,
+    patch: truncatePatch(file.patch),
+  }));
 
-  const issueNumbers = extractIssueNumbers([
-    pr.data.body ?? "",
-    ...commitMessages,
-  ]).filter((number) => number !== pullNumber);
+  const commits: PullRequestCommit[] = commitList.map((commit) => ({
+    sha: commit.sha,
+    message: commit.commit.message,
+    authoredAt: commit.commit.author?.date ?? null,
+  }));
 
-  const linkedIssues = (
-    await Promise.all(
-      issueNumbers.map(async (issueNumber) => {
-        try {
-          const issue = await octokit.issues.get({ owner, repo, issue_number: issueNumber });
+  const issueReferenceText = [
+    pullRequestData.title,
+    pullRequestData.body ?? "",
+    ...commits.map((commit) => commit.message),
+  ].join("\n");
 
-          if ((issue.data as { pull_request?: unknown }).pull_request) {
-            return null;
-          }
+  const issueReferences = extractIssueReferences({
+    text: issueReferenceText,
+    defaultOwner: parsed.owner,
+    defaultRepo: parsed.repo,
+  });
 
-          return {
-            number: issueNumber,
-            title: issue.data.title,
-            state: issue.data.state as "open" | "closed",
-            url: issue.data.html_url,
-          };
-        } catch {
-          return null;
-        }
-      }),
-    )
-  ).filter((issue): issue is NonNullable<typeof issue> => issue !== null);
+  const linkedIssues = await fetchLinkedIssues({
+    octokit,
+    references: issueReferences,
+  });
 
   return {
-    owner,
-    repo,
-    pullNumber,
-    prTitle: pr.data.title,
-    prBody: pr.data.body ?? "",
-    prAuthor: pr.data.user?.login ?? "unknown",
-    prUrl,
-    additions: pr.data.additions,
-    deletions: pr.data.deletions,
-    changedFiles: pr.data.changed_files,
-    fileDiffs: files.map((file) => ({
-      filename: file.filename,
-      status: file.status,
-      additions: file.additions,
-      deletions: file.deletions,
-      patch: trimPatch(file.patch),
-    })),
-    commitMessages,
+    owner: parsed.owner,
+    repo: parsed.repo,
+    number: parsed.number,
+    title: pullRequestData.title,
+    body: pullRequestData.body ?? "",
+    url: pullRequestData.html_url,
+    author: pullRequestData.user?.login ?? "unknown",
+    baseBranch: pullRequestData.base.ref,
+    headBranch: pullRequestData.head.ref,
+    additions: pullRequestData.additions,
+    deletions: pullRequestData.deletions,
+    changedFiles: pullRequestData.changed_files,
+    createdAt: pullRequestData.created_at,
+    mergedAt: pullRequestData.merged_at,
+    labels: pullRequestData.labels
+      .map((label) => (typeof label === "string" ? label : label.name ?? ""))
+      .filter(Boolean),
+    commits,
+    files,
     linkedIssues,
   };
 }

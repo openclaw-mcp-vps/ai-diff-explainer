@@ -2,118 +2,141 @@ import OpenAI from "openai";
 import { z } from "zod";
 import type { PullRequestContext } from "@/lib/github";
 
-const SummarySchema = z.object({
-  bullets: z.array(z.string().min(8).max(220)).length(3),
+const responseSchema = z.object({
+  bullets: z.array(z.string().min(24).max(260)).length(3),
 });
 
-function getClient() {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    throw new Error("OPENAI_API_KEY is missing.");
-  }
+const openai = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
 
-  return new OpenAI({ apiKey });
+function titleCaseFromPath(path: string) {
+  const chunk = path.split("/")[0] ?? "application";
+  return chunk
+    .replace(/[-_]/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
-function compactDiffForPrompt(context: PullRequestContext) {
-  const files = context.fileDiffs.slice(0, 20).map((file) => {
-    const header = `${file.filename} (+${file.additions}/-${file.deletions}, ${file.status})`;
-    if (!file.patch) return header;
-    return `${header}\n${file.patch}`;
-  });
+function fallbackSummary(context: PullRequestContext) {
+  const topAreas = Array.from(
+    new Set(context.files.slice(0, 4).map((file) => titleCaseFromPath(file.filename)))
+  );
 
-  return files.join("\n\n---\n\n");
+  const areaSentence =
+    topAreas.length > 0
+      ? `mostly in ${topAreas.join(", ")}`
+      : "across core application areas";
+
+  const linkedIssueSentence =
+    context.linkedIssues.length > 0
+      ? `It also aligns to ${context.linkedIssues.length} linked issue${
+          context.linkedIssues.length === 1 ? "" : "s"
+        } including ${context.linkedIssues
+          .slice(0, 2)
+          .map((issue) => `#${issue.number} ${issue.title}`)
+          .join(" and ")}.`
+      : "No linked issue references were detected in the PR title, body, or commits.";
+
+  return [
+    `This PR delivers \"${context.title}\" and updates ${context.changedFiles} file${
+      context.changedFiles === 1 ? "" : "s"
+    }, ${areaSentence}.`,
+    `Engineering scope is moderate (${context.additions} additions, ${context.deletions} deletions), which suggests a meaningful release with stakeholder-visible changes rather than a trivial refactor.`,
+    linkedIssueSentence,
+  ];
 }
 
-function extractTextContent(content: unknown): string {
-  if (typeof content === "string") return content;
+function buildPrompt(context: PullRequestContext) {
+  const condensedContext = {
+    pullRequest: {
+      repository: `${context.owner}/${context.repo}`,
+      number: context.number,
+      title: context.title,
+      body: context.body,
+      author: context.author,
+      baseBranch: context.baseBranch,
+      headBranch: context.headBranch,
+      changedFiles: context.changedFiles,
+      additions: context.additions,
+      deletions: context.deletions,
+      labels: context.labels,
+    },
+    commits: context.commits.slice(0, 12).map((commit) => ({
+      sha: commit.sha.slice(0, 8),
+      message: commit.message,
+    })),
+    files: context.files.slice(0, 20).map((file) => ({
+      filename: file.filename,
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      patch: file.patch,
+    })),
+    linkedIssues: context.linkedIssues,
+  };
 
-  if (Array.isArray(content)) {
-    return content
-      .map((item) => {
-        if (typeof item === "string") return item;
-
-        if (item && typeof item === "object" && "type" in item && "text" in item) {
-          const maybeText = item as { type?: string; text?: string };
-          if (maybeText.type === "text" && typeof maybeText.text === "string") {
-            return maybeText.text;
-          }
-        }
-
-        return "";
-      })
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  return "";
-}
-
-function fallbackBullets(text: string) {
-  const lines = text
-    .split("\n")
-    .map((line) => line.replace(/^[-*\d.)\s]+/, "").trim())
-    .filter(Boolean);
-
-  const bullets = lines.slice(0, 3);
-
-  while (bullets.length < 3) {
-    bullets.push("Update delivered and ready for stakeholder review.");
-  }
-
-  return bullets;
-}
-
-export async function summarizePullRequest(context: PullRequestContext) {
-  const client = getClient();
-  const model = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
-
-  const prompt = [
+  return [
     "Summarize this pull request for non-technical stakeholders.",
-    "Output valid JSON only with shape: {\"bullets\": [string, string, string]}.",
-    "Each bullet must be one sentence, plain English, no code words, no acronyms unless unavoidable.",
-    "Focus on customer impact, workflow impact, and risk/rollout notes.",
-    "If linked issues are present, include their business context.",
-    "",
-    `Repository: ${context.owner}/${context.repo}`,
-    `PR: ${context.prTitle}`,
-    `Author: ${context.prAuthor}`,
-    `Stats: +${context.additions} / -${context.deletions} across ${context.changedFiles} files`,
-    `PR Description: ${context.prBody || "(empty)"}`,
-    `Commit Messages: ${context.commitMessages.join(" | ") || "(none)"}`,
-    `Linked Issues: ${
-      context.linkedIssues.length
-        ? context.linkedIssues.map((issue) => `#${issue.number} ${issue.title} (${issue.state})`).join(" | ")
-        : "(none)"
-    }`,
-    "Diff Excerpts:",
-    compactDiffForPrompt(context),
-  ].join("\n");
+    "Output strict JSON: {\"bullets\": [\"...\", \"...\", \"...\"]}",
+    "Rules:",
+    "- Exactly 3 bullets, each one sentence.",
+    "- Focus on user impact, product behavior, and release risk.",
+    "- Avoid code jargon and avoid mentioning file names unless critical.",
+    "- Keep each bullet under 260 characters.",
+    JSON.stringify(condensedContext, null, 2),
+  ].join("\n\n");
+}
 
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0.2,
-    messages: [
-      {
-        role: "system",
-        content:
-          "You create executive-ready release note summaries from code changes. Always produce exactly three bullets in JSON.",
-      },
-      {
-        role: "user",
-        content: prompt,
-      },
-    ],
-  });
+function parseJsonObject(raw: string) {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    return JSON.parse(trimmed);
+  }
 
-  const content = extractTextContent(response.choices[0]?.message?.content ?? "");
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
+    throw new Error("No JSON object found in model output.");
+  }
+
+  return JSON.parse(trimmed.slice(firstBrace, lastBrace + 1));
+}
+
+export async function generateStakeholderSummary(context: PullRequestContext) {
+  const fallback = fallbackSummary(context);
+
+  if (!openai) {
+    return fallback;
+  }
 
   try {
-    const maybeJson = JSON.parse(content);
-    const parsed = SummarySchema.parse(maybeJson);
-    return parsed;
+    const completion = await openai.chat.completions.create({
+      model: process.env.OPENAI_MODEL ?? "gpt-4.1-mini",
+      temperature: 0.2,
+      response_format: {
+        type: "json_object",
+      },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You write release-note bullets for product, design, support, and leadership audiences.",
+        },
+        {
+          role: "user",
+          content: buildPrompt(context),
+        },
+      ],
+    });
+
+    const content = completion.choices[0]?.message?.content;
+    if (typeof content !== "string") {
+      return fallback;
+    }
+
+    const parsed = responseSchema.parse(parseJsonObject(content));
+    return parsed.bullets;
   } catch {
-    const bullets = fallbackBullets(content);
-    return SummarySchema.parse({ bullets });
+    return fallback;
   }
 }

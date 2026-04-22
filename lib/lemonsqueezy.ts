@@ -1,182 +1,119 @@
-import crypto from "crypto";
-import { mkdir, readFile, writeFile } from "fs/promises";
-import path from "path";
-import { createCheckout, lemonSqueezySetup } from "@lemonsqueezy/lemonsqueezy.js";
+import crypto from "node:crypto";
+import { normalizeEmail } from "@/lib/database";
 
-const DATA_FILE = path.join(process.cwd(), "data", "purchases.json");
+const SIGNATURE_TOLERANCE_SECONDS = 300;
 
-export type PurchaseRecord = {
-  orderId: string;
-  eventName: string;
-  email?: string;
-  createdAt: string;
-};
-
-type PurchaseStore = {
-  purchases: PurchaseRecord[];
-};
-
-async function ensureStore(): Promise<void> {
-  await mkdir(path.dirname(DATA_FILE), { recursive: true });
-
-  try {
-    await readFile(DATA_FILE, "utf8");
-  } catch {
-    const initial: PurchaseStore = { purchases: [] };
-    await writeFile(DATA_FILE, JSON.stringify(initial, null, 2), "utf8");
-  }
-}
-
-async function readStore(): Promise<PurchaseStore> {
-  await ensureStore();
-  const raw = await readFile(DATA_FILE, "utf8");
-
-  try {
-    const parsed = JSON.parse(raw) as PurchaseStore;
-    if (!Array.isArray(parsed.purchases)) {
-      return { purchases: [] };
-    }
-    return parsed;
-  } catch {
-    return { purchases: [] };
-  }
-}
-
-async function writeStore(store: PurchaseStore): Promise<void> {
-  await ensureStore();
-  await writeFile(DATA_FILE, JSON.stringify(store, null, 2), "utf8");
-}
-
-export function getCheckoutUrl() {
-  const raw = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID?.trim();
-  if (!raw) return null;
-
-  if (raw.startsWith("http://") || raw.startsWith("https://")) {
-    return raw;
-  }
-
-  return `https://checkout.lemonsqueezy.com/buy/${raw}`;
-}
-
-function withRedirectParams(url: string, successUrl: string, cancelUrl?: string) {
-  try {
-    const parsed = new URL(url);
-    parsed.searchParams.set("checkout[success_url]", successUrl);
-    if (cancelUrl) {
-      parsed.searchParams.set("checkout[cancel_url]", cancelUrl);
-    }
-    return parsed.toString();
-  } catch {
-    return url;
-  }
-}
-
-export async function createCheckoutUrl(options: { successUrl: string; cancelUrl?: string }) {
-  const fallback = getCheckoutUrl();
-
-  const storeId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_STORE_ID;
-  const variantId = process.env.NEXT_PUBLIC_LEMON_SQUEEZY_PRODUCT_ID;
-  const apiKey = process.env.LEMON_SQUEEZY_API_KEY;
-
-  if (!apiKey || !storeId || !variantId) {
-    return fallback ? withRedirectParams(fallback, options.successUrl, options.cancelUrl) : null;
-  }
-
-  lemonSqueezySetup({ apiKey });
-
-  const checkout = (await createCheckout(Number(storeId), Number(variantId), {
-    checkoutOptions: {
-      embed: true,
-      media: false,
-      logo: false,
-    },
-    checkoutData: {
-      custom: {
-        source: "ai-diff-explainer",
-      },
-    },
-  })) as unknown as {
-    data?: {
-      data?: {
-        attributes?: {
-          url?: string;
-        };
-      };
-    };
-    error?: unknown;
+type StripeCheckoutSession = {
+  id?: string;
+  object?: string;
+  customer_email?: string | null;
+  customer_details?: {
+    email?: string | null;
   };
+  amount_total?: number | null;
+  currency?: string | null;
+  payment_link?: string | null;
+};
 
-  const checkoutUrl = checkout.data?.data?.attributes?.url ?? fallback;
-  if (!checkoutUrl) {
+export type StripeWebhookEvent = {
+  id: string;
+  type: string;
+  data: {
+    object: StripeCheckoutSession;
+  };
+};
+
+function secureCompare(a: string, b: string) {
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+
+  if (aBuffer.length !== bBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+export function verifyStripeWebhookSignature({
+  payload,
+  signatureHeader,
+  secret,
+}: {
+  payload: string;
+  signatureHeader: string;
+  secret: string;
+}) {
+  const parts = signatureHeader.split(",").map((part) => part.trim());
+  const timestamp = parts
+    .find((part) => part.startsWith("t="))
+    ?.slice(2)
+    .trim();
+  const signatures = parts
+    .filter((part) => part.startsWith("v1="))
+    .map((part) => part.slice(3).trim())
+    .filter(Boolean);
+
+  if (!timestamp || signatures.length === 0) {
+    return false;
+  }
+
+  const timestampNumber = Number.parseInt(timestamp, 10);
+  if (Number.isNaN(timestampNumber)) {
+    return false;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestampNumber) > SIGNATURE_TOLERANCE_SECONDS) {
+    return false;
+  }
+
+  const signedPayload = `${timestamp}.${payload}`;
+  const expected = crypto
+    .createHmac("sha256", secret)
+    .update(signedPayload)
+    .digest("hex");
+
+  return signatures.some((signature) => secureCompare(signature, expected));
+}
+
+export function parseStripeWebhookEvent(payload: string): StripeWebhookEvent {
+  const parsed = JSON.parse(payload) as Partial<StripeWebhookEvent>;
+
+  if (
+    typeof parsed.id !== "string" ||
+    typeof parsed.type !== "string" ||
+    typeof parsed.data !== "object" ||
+    parsed.data === null ||
+    typeof parsed.data.object !== "object" ||
+    parsed.data.object === null
+  ) {
+    throw new Error("Invalid webhook payload shape.");
+  }
+
+  return parsed as StripeWebhookEvent;
+}
+
+export function extractCheckoutPurchase(event: StripeWebhookEvent) {
+  if (
+    event.type !== "checkout.session.completed" &&
+    event.type !== "checkout.session.async_payment_succeeded"
+  ) {
     return null;
   }
 
-  return withRedirectParams(checkoutUrl, options.successUrl, options.cancelUrl);
-}
+  const session = event.data.object;
+  const email = session.customer_details?.email ?? session.customer_email;
 
-export function verifyLemonSignature(rawBody: string, signature?: string | null) {
-  const secret = process.env.LEMON_SQUEEZY_WEBHOOK_SECRET;
-  if (!secret || !signature) return false;
-
-  const digest = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  const incoming = Buffer.from(signature, "utf8");
-  const computed = Buffer.from(digest, "utf8");
-
-  if (incoming.length !== computed.length) return false;
-  return crypto.timingSafeEqual(incoming, computed);
-}
-
-export async function recordPurchase(record: PurchaseRecord) {
-  const store = await readStore();
-  const exists = store.purchases.some((item) => item.orderId === record.orderId);
-  if (!exists) {
-    store.purchases.push(record);
-    await writeStore(store);
+  if (!email) {
+    return null;
   }
-}
 
-export async function hasRecordedPurchase(orderId?: string | null) {
-  if (!orderId) return false;
-  const store = await readStore();
-  return store.purchases.some((item) => item.orderId === orderId);
-}
-
-export function extractOrderId(payload: unknown) {
-  if (!payload || typeof payload !== "object") return null;
-  const data = payload as {
-    data?: { id?: string; attributes?: { order_id?: number | string } };
-    meta?: { custom_data?: { order_id?: string } };
+  return {
+    email: normalizeEmail(email),
+    amountTotal: typeof session.amount_total === "number" ? session.amount_total : null,
+    currency: typeof session.currency === "string" ? session.currency : null,
+    sessionId: typeof session.id === "string" ? session.id : null,
+    paymentLinkId:
+      typeof session.payment_link === "string" ? session.payment_link : null,
   };
-
-  const attrOrderId = data.data?.attributes?.order_id;
-  if (typeof attrOrderId === "number") return String(attrOrderId);
-  if (typeof attrOrderId === "string" && attrOrderId.length > 0) return attrOrderId;
-
-  const dataId = data.data?.id;
-  if (typeof dataId === "string" && dataId.length > 0) return dataId;
-
-  const customOrderId = data.meta?.custom_data?.order_id;
-  if (typeof customOrderId === "string" && customOrderId.length > 0) return customOrderId;
-
-  return null;
-}
-
-export function extractEventName(payload: unknown) {
-  if (!payload || typeof payload !== "object") return "unknown";
-  const data = payload as { meta?: { event_name?: string } };
-  return data.meta?.event_name ?? "unknown";
-}
-
-export function extractBuyerEmail(payload: unknown) {
-  if (!payload || typeof payload !== "object") return undefined;
-  const data = payload as {
-    data?: {
-      attributes?: {
-        user_email?: string;
-        customer_email?: string;
-      };
-    };
-  };
-
-  return data.data?.attributes?.user_email ?? data.data?.attributes?.customer_email;
 }

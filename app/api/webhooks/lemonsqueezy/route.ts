@@ -1,64 +1,65 @@
 import { NextResponse } from "next/server";
-import { PAID_COOKIE_NAME, paidCookieOptions } from "@/lib/auth";
+import { recordStripePurchase } from "@/lib/database";
 import {
-  extractBuyerEmail,
-  extractEventName,
-  extractOrderId,
-  hasRecordedPurchase,
-  recordPurchase,
-  verifyLemonSignature,
+  extractCheckoutPurchase,
+  parseStripeWebhookEvent,
+  verifyStripeWebhookSignature,
 } from "@/lib/lemonsqueezy";
 
 export const runtime = "nodejs";
 
-export async function GET(request: Request) {
-  const url = new URL(request.url);
-  const checkoutState = url.searchParams.get("checkout");
-  const orderId = url.searchParams.get("order_id");
-
-  if (checkoutState !== "success") {
-    return NextResponse.redirect(new URL("/#pricing", request.url));
-  }
-
-  if (orderId) {
-    const isKnownOrder = await hasRecordedPurchase(orderId);
-    if (!isKnownOrder) {
-      return NextResponse.redirect(new URL("/?payment=pending", request.url));
-    }
-  }
-
-  const response = NextResponse.redirect(new URL("/dashboard", request.url));
-  response.cookies.set(PAID_COOKIE_NAME, "1", paidCookieOptions);
-  return response;
-}
-
 export async function POST(request: Request) {
-  const rawBody = await request.text();
-  const signature = request.headers.get("x-signature");
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
-  if (!verifyLemonSignature(rawBody, signature)) {
-    return Response.json({ error: "Invalid webhook signature." }, { status: 401 });
+  if (!webhookSecret) {
+    return NextResponse.json(
+      { error: "Missing STRIPE_WEBHOOK_SECRET environment variable." },
+      { status: 500 }
+    );
   }
 
-  let payload: unknown;
+  const signatureHeader = request.headers.get("stripe-signature");
+  if (!signatureHeader) {
+    return NextResponse.json(
+      { error: "Missing Stripe signature header." },
+      { status: 400 }
+    );
+  }
+
+  const payload = await request.text();
+  const isValid = verifyStripeWebhookSignature({
+    payload,
+    signatureHeader,
+    secret: webhookSecret,
+  });
+
+  if (!isValid) {
+    return NextResponse.json(
+      { error: "Stripe webhook signature verification failed." },
+      { status: 400 }
+    );
+  }
+
   try {
-    payload = JSON.parse(rawBody);
+    const event = parseStripeWebhookEvent(payload);
+    const purchase = extractCheckoutPurchase(event);
+
+    if (purchase) {
+      recordStripePurchase({
+        email: purchase.email,
+        stripeEventId: event.id,
+        amountTotal: purchase.amountTotal,
+        currency: purchase.currency,
+        sessionId: purchase.sessionId,
+        paymentLinkId: purchase.paymentLinkId,
+      });
+    }
+
+    return NextResponse.json({ received: true });
   } catch {
-    return Response.json({ error: "Invalid JSON body." }, { status: 400 });
+    return NextResponse.json(
+      { error: "Webhook payload parsing failed." },
+      { status: 400 }
+    );
   }
-
-  const eventName = extractEventName(payload);
-  const orderId = extractOrderId(payload);
-  const email = extractBuyerEmail(payload);
-
-  if (orderId) {
-    await recordPurchase({
-      orderId,
-      eventName,
-      email,
-      createdAt: new Date().toISOString(),
-    });
-  }
-
-  return Response.json({ ok: true });
 }
